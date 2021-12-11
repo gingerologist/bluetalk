@@ -11,21 +11,19 @@
 #include "esp_log.h"
 #include "esp_vfs_dev.h"
 #include "esp_crc.h"
+#include "esp_system.h"
 
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
 
-#define BIT_0 (1 << 0)  // config_adv_data
-#define BIT_1 (1 << 1)  // start advertising
-#define BIT_2 (1 << 2)  // stop advertising
+#define ADV_START_COMPLETE (1 << 0)
+#define ADV_STOP_COMPLETE (1 << 1)
 
-static const char *tag = "BLUETALK";
+static const char *TAG = "BLUETALK";
 
-static EventGroupHandle_t eg_handle;
-static StaticEventGroup_t eg_data;
-
-static uint8_t out_mfr_data[32] = {};
+static QueueHandle_t adv_queue;
+static EventGroupHandle_t evt_handle;
 
 static const esp_ble_scan_params_t scan_params_default = {
     .scan_type = BLE_SCAN_TYPE_PASSIVE,
@@ -39,11 +37,11 @@ static const esp_ble_adv_data_t adv_data_default = {
     .set_scan_rsp = false,
     .include_name = false,
     .include_txpower = false,
-    .min_interval = 0x0006, // 7.5ms
-    .max_interval = 0x000c, // 15ms
+    .min_interval = 0x0000,
+    .max_interval = 0x0000,
     .appearance = 0x00,
-    .manufacturer_len = 20,                  // TEST_MANUFACTURER_DATA_LEN,
-    .p_manufacturer_data = &out_mfr_data[0], //&test_manufacturer[0],
+    .manufacturer_len = 0,
+    .p_manufacturer_data = NULL,
     .service_data_len = 0,
     .p_service_data = NULL,
     .service_uuid_len = 0,
@@ -60,24 +58,13 @@ static const esp_ble_adv_params_t adv_params_default = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
-/** prefix 2 bytes (0x)
-    payload min 2 bytes, max 31 * 2 bytes,
-    crc8, 2 bytes,
-    new line, 1 byte,
-    null-termination, 1 byte */
-
 #define STDIN_BUF_LEN (2 + 31 * 2 + 2 + 2 + 1 + 1)
 char stdin_buf[STDIN_BUF_LEN] = {};
-uint8_t outgoing_buf[32] = {};
+char hex_char[] = "0123456789abcdef";
+char bda_buf[13] = {0};
+char mfr_buf[53] = {0};
 
-uint8_t hex_char[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
-                        '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
-
-uint8_t bda_buf[16] = {};
-uint8_t mfr_buf[64] = {};
-uint8_t all_buf[128] = {};
-
-char *u8_to_hex(uint8_t *buf, size_t buf_len, uint8_t *data, size_t data_len) {
+char *u8_to_hex(uint8_t *data, size_t data_len, char *buf, size_t buf_len) {
     memset(buf, 0, buf_len);
     if (data_len == 0)
         return (char *)buf;
@@ -88,15 +75,51 @@ char *u8_to_hex(uint8_t *buf, size_t buf_len, uint8_t *data, size_t data_len) {
     return (char *)buf;
 }
 
+bool hex_to_u8(char high, char low, uint8_t *u8) {
+    if (low >= '0' && low <= '9') {
+        *u8 = low - '0';
+    } else if (low >= 'a' && low <= 'f') {
+        *u8 = low - 'a' + 10;
+    } else if (low >= 'A' && low <= 'F') {
+        *u8 = low - 'A' + 10;
+    } else {
+        return false;
+    }
+
+    if (high >= '0' && high <= '9') {
+        *u8 += 16 * (high - '0');
+    } else if (high >= 'a' && high <= 'f') {
+        *u8 += 16 * (high - 'a' + 10);
+    } else if (high >= 'A' && high <= 'F') {
+        *u8 += 16 * (high - 'A' + 10);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool hex_str_to_u8s(char *str, uint8_t *data) {
+    int l = strlen(str);
+    if (l % 2 || l / 2 > 26)
+        return false;
+
+    for (int i = 0; i < l / 2; i++) {
+        if (!hex_to_u8(str[i * 2], str[i * 2 + 1], &data[i + 1]))
+            return false;
+    }
+
+    data[0] = l / 2;
+    return true;
+}
+
 static void esp_gap_cb(esp_gap_ble_cb_event_t event,
                        esp_ble_gap_cb_param_t *param) {
     uint8_t *mfr_data;
     uint8_t mfr_data_len;
-
     switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT:
         esp_ble_gap_start_scanning(0);
-        ESP_LOGI(tag, "starting ble scan (permanently)");
+        ESP_LOGI(TAG, "starting ble scan (permanently)");
         break;
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
         esp_ble_gap_cb_param_t *scan_result = (esp_ble_gap_cb_param_t *)param;
@@ -107,12 +130,16 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event,
                 ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE, &mfr_data_len);
 
             if (mfr_data_len > 0) {
-                char *bda_str = u8_to_hex(bda_buf, sizeof(bda_buf),
-                                          scan_result->scan_rst.bda, 6);
-                char *mfr_str =
-                    u8_to_hex(mfr_buf, sizeof(mfr_buf), mfr_data, mfr_data_len);
+                // b01bca57
+                if (mfr_data[0] != 0xb0 || mfr_data[1] != 0x1b ||
+                    mfr_data[2] != 0xca || mfr_data[3] != 0x57)
+                    return;
 
-                printf("BTRECV ADDR: %s, MFR: %s\n", bda_str, mfr_str);
+                char *bda_str = u8_to_hex(scan_result->scan_rst.bda, 6, bda_buf,
+                                          sizeof(bda_buf));
+                char *mfr_str =
+                    u8_to_hex(mfr_data, mfr_data_len, mfr_buf, sizeof(mfr_buf));
+                printf("BULBCAST %s %s\n", bda_str, mfr_str);
             }
         } break;
         default:
@@ -120,58 +147,67 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event,
         }
     } break;
     case ESP_GAP_BLE_SCAN_START_COMPLETE_EVT:
-        ESP_LOGI(tag, "ble scan started");
+        ESP_LOGI(TAG, "ble scan started");
         break;
-    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-        xEventGroupSetBits(eg_handle, BIT_0);
-        break;
+    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT: {
+        esp_ble_adv_params_t adv_params = adv_params_default;
+        ESP_ERROR_CHECK(esp_ble_gap_start_advertising(&adv_params));
+    } break;
     case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-        xEventGroupSetBits(eg_handle, BIT_1);
+        xEventGroupSetBits(evt_handle, ADV_START_COMPLETE);
         break;
     case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-        xEventGroupSetBits(eg_handle, BIT_2);
+        xEventGroupSetBits(evt_handle, ADV_STOP_COMPLETE);
         break;
     default:
-        ESP_LOGI(tag, "unhandled ble event %d in esp_gap_cb()", event);
+        ESP_LOGI(TAG, "unhandled ble event %d in esp_gap_cb()", event);
     }
 }
 
-bool hex_to_u8(char high, char low, uint8_t *u8) {
-    if (low >= '0' && low <= '9') {
-        *u8 = low - '0';
-    } else if (low >= 'a' && low <= 'f') {
-        *u8 = low - 'a' + 10;
-    } else {
-        return false;
+void ble_adv_scan(void *pvParams) {
+    uint8_t mfr[27] = {0};
+    evt_handle = xEventGroupCreate();
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(esp_gap_cb));
+
+    esp_ble_scan_params_t scan_params = scan_params_default;
+    ESP_ERROR_CHECK(esp_ble_gap_set_scan_params(&scan_params));
+
+    while (1) {
+        if (xQueueReceive(adv_queue, mfr, portMAX_DELAY) != pdTRUE) {
+            ESP_LOGE(TAG, "Queue receive error");
+            continue;
+        }
+
+        esp_ble_adv_data_t adv_data = adv_data_default;
+        adv_data.p_manufacturer_data = &mfr[1];
+        adv_data.manufacturer_len = mfr[0];
+        ESP_ERROR_CHECK(esp_ble_gap_config_adv_data(&adv_data));
+
+        // wait advertising started
+        xEventGroupWaitBits(evt_handle, ADV_START_COMPLETE, pdFALSE, pdFALSE,
+                            0);
+        xEventGroupClearBits(evt_handle, ADV_START_COMPLETE);
+        ESP_LOGI(TAG, "advertising started");
+
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+
+        ESP_ERROR_CHECK(esp_ble_gap_stop_advertising());
+
+        // wait advertising started
+        xEventGroupWaitBits(evt_handle, ADV_STOP_COMPLETE, pdFALSE, pdFALSE, 0);
+        xEventGroupClearBits(evt_handle, ADV_STOP_COMPLETE);
+        ESP_LOGI(TAG, "advertising stopped");
     }
-
-    if (high >= '0' && high <= '9') {
-        *u8 += 16 * (high - '0');
-    } else if (high >= 'a' && high <= 'f') {
-        *u8 += 16 * (high - 'a' + 10);
-    } else {
-        return false;
-    }
-    return true;
-}
-
-bool hex_str_to_u8s(char *str, uint8_t *data, size_t *data_len) {
-    int l = strlen(str);
-    if (l % 2)
-        return false;
-
-    for (int i = 0; i < l / 2; i++) {
-        if (!hex_to_u8(str[i * 2], str[i * 2 + 1], &data[i]))
-            return false;
-    }
-
-    *data_len = l / 2;
-    return true;
 }
 
 void app_main(void) {
-    // init (a)synchronizer
-    eg_handle = xEventGroupCreateStatic(&eg_data);
+    adv_queue = xQueueCreate(40, 32);
 
     /* init nvs flash */
     esp_err_t err = nvs_flash_init();
@@ -182,6 +218,8 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(err);
 
+    xTaskCreate(&ble_adv_scan, "ble_adv_scan", 4096, NULL, 6, NULL);
+
     // Initialize VFS & UART so we can use std::cout/cin
     setvbuf(stdin, NULL, _IONBF, 0);
     /* Install UART driver for interrupt-driven reads and writes */
@@ -191,97 +229,34 @@ void app_main(void) {
     esp_vfs_dev_uart_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
     esp_vfs_dev_uart_port_set_rx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM,
                                               ESP_LINE_ENDINGS_CR);
-    /* Move the caret to the beginning of the next line on '\n' */
     esp_vfs_dev_uart_port_set_tx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM,
                                               ESP_LINE_ENDINGS_CRLF);
-
-    // this is not yet implemented for c3.
-    // ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
-    // TODO add error checking
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    esp_bt_controller_init(&bt_cfg);
-    esp_bt_controller_enable(ESP_BT_MODE_BLE);
-
-    esp_bt_sleep_disable();
-
-    esp_bluedroid_init();
-    esp_bluedroid_enable();
-
-    err = esp_ble_gap_register_callback(esp_gap_cb);
-    if (err != ESP_OK) {
-        ESP_LOGE(tag, "error registerring gap callback: %s",
-                 esp_err_to_name(err));
-        vTaskDelay(1000);
-        return;
-    }
-
-    esp_ble_scan_params_t scan_params = scan_params_default;
-    esp_ble_gap_set_scan_params(&scan_params);
 
     while (1) {
         // read a line from stdin
         char *str = fgets(stdin_buf, STDIN_BUF_LEN, stdin);
         if (str == NULL) {
-            ESP_LOGE(tag, "fgets returns NULL");
+            ESP_LOGE(TAG, "fgets returns NULL");
             vTaskDelay(100 / portTICK_PERIOD_MS);
             continue;
         }
 
         if (str[strlen(str) - 1] != '\n') {
-            ESP_LOGI(tag, "from stdin: %s", str);
-            ESP_LOGE(tag, "string not ending with newline (too large?)");
+            ESP_LOGI(TAG, "from stdin: %s", str);
+            ESP_LOGE(TAG, "string not ending with newline (too large?)");
             continue;
         }
 
         str[strlen(str) - 1] = '\0';
-        ESP_LOGI(tag, "from stdin: %s", str);
+        ESP_LOGI(TAG, "from stdin: %s", str);
 
-        size_t data_len = 0;
-        if (!hex_str_to_u8s(str, outgoing_buf, &data_len)) {
-            ESP_LOGE(tag, "not valid hex string");
+        uint8_t msg[32] = {0};
+        if (!hex_str_to_u8s(str, msg)) {
+            ESP_LOGE(TAG, "not valid hex string");
             continue;
         }
 
-        esp_log_buffer_hex(tag, outgoing_buf, data_len);
-
-        esp_ble_adv_data_t adv_data = adv_data_default;
-        adv_data.p_manufacturer_data = &outgoing_buf[0];
-        adv_data.manufacturer_len = data_len;
-        esp_err_t ret = esp_ble_gap_config_adv_data(&adv_data);
-        if (ret) {
-            ESP_LOGE(tag, "config adv data failed, error code = %x", ret);
-            continue;
-        }
-
-        // wait config done
-        xEventGroupWaitBits(eg_handle, BIT_0, pdFALSE, pdFALSE, 0);
-        xEventGroupClearBits(eg_handle, BIT_0);
-
-        esp_ble_adv_params_t adv_params = adv_params_default;
-        err = esp_ble_gap_start_advertising(&adv_params);
-        if (ret) {
-            ESP_LOGE(tag, "error starting advertising: %s",
-                     esp_err_to_name(err));
-            continue;
-        }
-
-        // wait advertising started
-        xEventGroupWaitBits(eg_handle, BIT_1, pdFALSE, pdFALSE, 0);
-        xEventGroupClearBits(eg_handle, BIT_1);
-
-        vTaskDelay(50 / portTICK_PERIOD_MS);
-
-        err = esp_ble_gap_stop_advertising();
-        if (err) {
-            ESP_LOGE(tag, "error stopping advertising: %s",
-                     esp_err_to_name(err));
-            continue;
-        }
-
-        // wait advertising started
-        xEventGroupWaitBits(eg_handle, BIT_2, pdFALSE, pdFALSE, 0);
-        xEventGroupClearBits(eg_handle, BIT_2);
-        ESP_LOGI(tag, "advertising stopped");
+        esp_log_buffer_hex(TAG, msg, msg[0] + 1);
+        xQueueSend(adv_queue, msg, portMAX_DELAY); 
     }
 }
