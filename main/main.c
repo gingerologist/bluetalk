@@ -58,7 +58,7 @@ static const esp_ble_adv_params_t adv_params_default = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
-#define STDIN_BUF_LEN (2 + 31 * 2 + 2 + 2 + 1 + 1)
+#define STDIN_BUF_LEN (128)
 char stdin_buf[STDIN_BUF_LEN] = {};
 char hex_char[] = "0123456789abcdef";
 char bda_buf[13] = {0};
@@ -233,7 +233,6 @@ void app_main(void) {
                                               ESP_LINE_ENDINGS_CRLF);
 
     while (1) {
-        // read a line from stdin
         char *str = fgets(stdin_buf, STDIN_BUF_LEN, stdin);
         if (str == NULL) {
             ESP_LOGE(TAG, "fgets returns NULL");
@@ -242,7 +241,6 @@ void app_main(void) {
         }
 
         if (str[strlen(str) - 1] != '\n') {
-            ESP_LOGI(TAG, "from stdin: %s", str);
             ESP_LOGE(TAG, "string not ending with newline (too large?)");
             continue;
         }
